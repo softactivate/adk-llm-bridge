@@ -53,7 +53,7 @@
     "prepublishOnly": "bun run build && bun run lint:publish"
   },
   "peerDependencies": {
-    "@google/adk": ">=0.5.0"
+    "@google/adk": ">=0.5.0 <2"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -62,7 +62,7 @@
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.3",
     "@biomejs/biome": "^2.3.10",
-    "@google/adk": "^0.5.0",
+    "@google/adk": "^1.2.0",
     "@google/genai": "^1.40.0",
     "@types/bun": "latest",
     "bunup": "^0.16.32",
