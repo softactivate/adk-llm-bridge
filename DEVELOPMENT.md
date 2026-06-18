@@ -33,8 +33,8 @@ adk-llm-bridge/
 │   ├── basic-agent-openrouter/
 │   ├── basic-agent-lmstudio/
 │   └── express-server/
+├── bunup.config.ts             # Build config (bunup)
 ├── scripts/
-│   ├── build.ts                 # Custom build script
 │   └── test-example.sh          # Test examples with npm pack
 └── dist/                        # Built output (generated)
 ```
@@ -290,14 +290,34 @@ bun test --grep "Anthropic"
 
 ## Release Checklist
 
-1. Update version in `package.json`
-2. Run full CI: `bun run ci`
-3. Test an example with `npm pack`:
+1. Update `version` in `package.json`
+2. Bump the `adk-llm-bridge` dependency in every `examples/*/package.json` to the
+   new version (keep the caret range, e.g. `^0.5.2`)
+3. Add a `CHANGELOG.md` entry for the new version
+4. Run full CI: `bun run ci` (typecheck + lint + test + build + `publint`/`attw` gates)
+5. Test an example with `npm pack` (simulates production install, dedupes `@google/adk`):
    ```bash
    ./scripts/test-example.sh basic-agent-anthropic
    ```
-4. Create git tag and push
-5. Publish to npm: `npm publish`
+6. Commit everything together: `chore: release vX.Y.Z`
+7. Create an annotated git tag on that commit and push both:
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin main && git push origin vX.Y.Z
+   ```
+8. Publish to npm (the `prepublishOnly` hook re-runs build + `publint`/`attw`):
+   ```bash
+   npm publish --provenance --access public
+   ```
+9. Create the GitHub Release from the tag (`gh release create vX.Y.Z --generate-notes`)
+10. If a previously published version is broken, deprecate it:
+    ```bash
+    npm deprecate adk-llm-bridge@<broken> "Broken; upgrade to >=X.Y.Z. See #NN."
+    ```
+
+> **Build note:** the package is built with [`bunup`](https://bunup.dev)
+> (`bunup.config.ts`); there is no longer a `scripts/build.ts`. `scripts/` now
+> contains only `test-example.sh`.
 
 ## Resources
 
