@@ -23,7 +23,6 @@
     "url": "https://github.com/pailat/adk-llm-bridge/issues"
   },
   "type": "module",
-  "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -39,8 +38,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "bun run scripts/build.ts && bun run build:types",
-    "build:types": "bunx tsc --project tsconfig.build.json && bun run scripts/fix-declaration-imports.mjs",
+    "build": "bunup",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "typecheck:all": "bunx tsc --noEmit -p tsconfig.test.json",
@@ -50,8 +48,9 @@
     "format:fix": "biome format --write ./src ./tests",
     "check": "biome check ./src ./tests",
     "check:fix": "biome check --write ./src ./tests",
-    "ci": "bun run typecheck:all && bun run lint && bun test && bun run build",
-    "prepublishOnly": "bun run build"
+    "lint:publish": "publint --strict && attw --pack --profile esm-only",
+    "ci": "bun run typecheck:all && bun run lint && bun test && bun run build && bun run lint:publish",
+    "prepublishOnly": "bun run build && bun run lint:publish"
   },
   "peerDependencies": {
     "@google/adk": ">=0.5.0"
@@ -61,10 +60,13 @@
     "openai": "^6.27.0"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.3",
     "@biomejs/biome": "^2.3.10",
     "@google/adk": "^0.5.0",
     "@google/genai": "^1.40.0",
     "@types/bun": "latest",
+    "bunup": "^0.16.32",
+    "publint": "^0.3.21",
     "typescript": "^5.3.0"
   }
 }
