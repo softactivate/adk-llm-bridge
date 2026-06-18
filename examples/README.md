@@ -14,6 +14,26 @@ Examples of using `adk-llm-bridge` with Google ADK and multiple LLM providers.
 | [basic-agent-lmstudio](./basic-agent-lmstudio) | LM Studio | Multi-agent HelpDesk with local models |
 | [express-server](./express-server) | AI Gateway | Full HTTP API with tools, state & streaming |
 
+## Known limitations
+
+### Web UI "Sessions" tab (adk-devtools)
+
+With `@google/adk-devtools` 1.2.0, the **Sessions** tab in `bun run web` may render
+empty and the browser console shows `TypeError: i.sort is not a function`. This is an
+**upstream dev-ui bug** — the frontend calls `.sort()` on the paginated `listSessions`
+response object instead of on `response.sessions`. It is **not** an `adk-llm-bridge`
+issue, and it does not affect chat, tools, or multi-agent routing. Your sessions still
+persist server-side; only the in-UI list fails to render. To inspect sessions meanwhile:
+
+```bash
+# Hit the REST API of the server adk-devtools runs (default port 8000)
+curl http://localhost:8000/apps/<app>/users/<user>/sessions
+```
+
+…or use the `express-server` example, which lists sessions over HTTP. Note that
+`adk-devtools web` only supports `--session_service_uri memory://`, so sessions are
+in-memory and do not survive a server restart.
+
 ## Quick Start
 
 ### basic-agent-ai-gateway
@@ -143,7 +163,9 @@ curl "http://localhost:3000/session/SESSION_ID?userId=user-1"
 
 ## Important: adk-devtools Bundling
 
-When using `adk-devtools`, you **must** import `LLMRegistry` from `@google/adk` directly and register the LLM class manually. This is because `adk-devtools` bundles its own copy of `@google/adk`.
+The `basic-agent-*` examples use the **factory pattern** (`model: AIGateway(...)`, `model: Anthropic(...)`, etc.) — a `BaseLlm` instance is passed straight to `LlmAgent`, so **no registration is needed** and they run under `adk-devtools` as-is.
+
+Manual registration is required **only** when you reference a model by **string id** (as `express-server` does with `model: "anthropic/claude-sonnet-4.6"`): import `LLMRegistry` from `@google/adk` and register the LLM class manually, because `adk-devtools` bundles its own copy of `@google/adk`.
 
 ### AI Gateway
 

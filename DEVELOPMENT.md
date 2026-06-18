@@ -245,6 +245,13 @@ console.log('Request:', JSON.stringify(llmRequest, null, 2));
 
 Check if the provider supports streaming and the client handles SSE correctly.
 
+**4. Web UI "Sessions" tab empty / `TypeError: i.sort is not a function`**
+
+Upstream `@google/adk-devtools` bug (not ours): the dev-ui frontend calls `.sort()` on
+the paginated `listSessions` response object instead of `response.sessions`. Sessions
+still persist; verify via `curl http://localhost:8000/apps/<app>/users/<user>/sessions`
+or the `express-server` example. Tracked upstream against `google/adk-js`.
+
 ### Running Specific Tests
 
 ```bash
