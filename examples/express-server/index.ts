@@ -5,7 +5,7 @@
  * - Session management with state persistence
  * - Artifact storage (in-memory for demo)
  * - Memory service for searchable knowledge
- * - FunctionTool with ToolContext access
+ * - FunctionTool with Context access
  * - State injection in instructions
  * - Token-level streaming
  *
@@ -29,8 +29,8 @@ import {
   InMemoryArtifactService,
   InMemoryMemoryService,
   StreamingMode,
-  ToolContext,
 } from "@google/adk";
+import type { Context } from "@google/adk";
 import { AIGatewayLlm } from "adk-llm-bridge";
 import { z } from "zod";
 
@@ -38,10 +38,10 @@ LLMRegistry.register(AIGatewayLlm);
 
 const APP_NAME = "express-api";
 
-// --- Tools with ToolContext ---
+// --- Tools with Context ---
 
 /**
- * Tool that demonstrates state access via ToolContext.
+ * Tool that demonstrates state access via Context.
  * Stores notes in session state and can retrieve them later.
  */
 const notepadTool = new FunctionTool({
@@ -57,10 +57,10 @@ const notepadTool = new FunctionTool({
   }),
   execute: async (
     { action, content },
-    context?: ToolContext,
+    context?: Context,
   ): Promise<Record<string, unknown>> => {
     if (!context) {
-      return { status: "error", message: "ToolContext is required" };
+      return { status: "error", message: "Context is required" };
     }
 
     const notesKey = "user:notes"; // User-scoped state (persists across sessions)
@@ -196,8 +196,10 @@ app.get("/sessions/:userId", async (req, res) => {
       userId,
       sessions: response.sessions.map((s) => ({
         id: s.id,
-        createdAt: s.events?.[0]?.timestamp,
-        eventCount: s.events?.length || 0,
+        // listSessions returns sessions without events/state populated, so
+        // lastUpdateTime is the only timestamp available here. Use getSession
+        // (the /session/:id endpoint) for full event history.
+        updatedAt: s.lastUpdateTime,
       })),
     });
   } catch (error) {
@@ -382,7 +384,7 @@ app.listen(port, () => {
 ║    ✓ Session management with state                           ║
 ║    ✓ Artifact storage (in-memory)                            ║
 ║    ✓ Memory service                                          ║
-║    ✓ Tools with ToolContext                                  ║
+║    ✓ Tools with Context                                  ║
 ║    ✓ Token-level streaming                                   ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Endpoints:                                                  ║
