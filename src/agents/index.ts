@@ -104,6 +104,7 @@ export type { ExternalAgentConfig } from "./external-agent.js";
 export { ExternalAgent } from "./external-agent.js";
 export {
   PlaceholderExternalAgentDriver,
+  resolveAbortSignal,
 } from "./external-agent-driver.js";
 export type {
   ExternalAgentDriver,
@@ -142,6 +143,11 @@ export {
   collectContents,
   flattenContentsToPrompt,
 } from "./runtime/content-collector.js";
+export { classifyRecoverable } from "./runtime/error-classification.js";
+export type {
+  ClassifyRecoverableInput,
+  RecoverableClassification,
+} from "./runtime/error-classification.js";
 export type { AgentRuntimeRequestMetadata } from "./runtime/runtime-request.js";
 export type { AgentRuntimeSession } from "./runtime/runtime-session.js";
 export { ToolGateway } from "./tools/tool-gateway.js";

@@ -18,7 +18,12 @@ export const CLAUDE_AGENT_DEFINITION: ExternalAgentDefinition = {
   provider: CLAUDE_PROVIDER,
   runtime: "sdk",
   capabilities: {
-    streaming: true,
+    // STREAM-1: the SDK driver emits output at full-assistant-message
+    // granularity (it does not set `includePartialMessages` / handle
+    // `stream_event` token deltas), so it does not advertise token-level
+    // streaming. Flip this back to `true` only alongside a `stream_event`
+    // delta branch in the driver's `normalizeMessage`.
+    streaming: false,
     permissions: true,
     tools: true,
     subagents: true,

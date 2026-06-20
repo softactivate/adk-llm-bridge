@@ -8,6 +8,7 @@ import type { ExternalAgentProviderDefinition } from "./schema.js";
 
 export const CODEX_ENV_ALLOWLIST = [
   "CODEX_API_KEY",
+  "CODEX_ACCESS_TOKEN",
   "CODEX_HOME",
   "CODEX_EXECUTABLE",
   "CODEX_CLI_PATH",

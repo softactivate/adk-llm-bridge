@@ -26,6 +26,33 @@ export interface ExternalAgentRunRequest {
   tools?: readonly BaseTool[];
   toolGateway?: ToolGateway;
   runtimeSession?: AgentRuntimeSession;
+  /**
+   * First-class cancellation signal for the run. When this signal aborts,
+   * drivers MUST stop streaming and release any spawned subprocess/SDK
+   * resources (e.g. via the SDK's own abort/interrupt mechanism).
+   *
+   * This is the single, shared cancellation contract for all external-agent
+   * drivers. When unset, drivers SHOULD fall back to
+   * {@link InvocationContext.abortSignal} (`context.abortSignal`) for backward
+   * compatibility. Use {@link resolveAbortSignal} to obtain the effective
+   * signal honoring both sources.
+   */
+  abortSignal?: AbortSignal;
+}
+
+/**
+ * Resolve the effective cancellation signal for a run, preferring the
+ * first-class {@link ExternalAgentRunRequest.abortSignal} and falling back to
+ * the ADK {@link InvocationContext.abortSignal}. Returns `undefined` when
+ * neither is present.
+ *
+ * This is the one place every driver should call so they share a single
+ * cancellation contract.
+ */
+export function resolveAbortSignal(
+  request: Pick<ExternalAgentRunRequest, "abortSignal" | "context">,
+): AbortSignal | undefined {
+  return request.abortSignal ?? request.context?.abortSignal;
 }
 
 export interface ExternalAgentDriver {

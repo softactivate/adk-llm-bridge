@@ -8,8 +8,12 @@ import { existsSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExternalAgentEvent } from "../events.js";
-import type { ExternalAgentRunRequest } from "../external-agent-driver.js";
+import {
+  type ExternalAgentRunRequest,
+  resolveAbortSignal,
+} from "../external-agent-driver.js";
 import { mapPermissionPolicyToFlags } from "../permissions/mapper.js";
+import { classifyRecoverable } from "../runtime/error-classification.js";
 import type { ExternalAgentPermissionPolicy } from "../permissions/schema.js";
 import { CLAUDE_PROVIDER } from "../provider/schema.js";
 import {
@@ -34,6 +38,7 @@ type ClaudeAgentSdkSettingSource = "user" | "project" | "local";
 type ClaudeAgentSdkOptions = {
   cwd?: string;
   env?: Record<string, string | undefined>;
+  abortController?: AbortController;
   permissionMode?: ClaudeAgentSdkPermissionMode;
   additionalDirectories?: string[];
   pathToClaudeCodeExecutable?: string;
@@ -55,11 +60,22 @@ type ClaudeAgentSdkToolResult = {
 };
 type ClaudeAgentSdkToolDefinition = unknown;
 
+/**
+ * The object returned by `query()`. The real SDK returns a `Query` (an
+ * `AsyncGenerator` that additionally exposes `interrupt()`); generator-based
+ * test fakes expose `return()`. Both are used to tear down the spawned
+ * subprocess on early break/error (LIFECYCLE-1).
+ */
+type ClaudeAgentSdkQuery = AsyncIterable<ClaudeAgentSdkMessage> & {
+  interrupt?(): Promise<void> | void;
+  return?(value?: unknown): Promise<unknown> | unknown;
+};
+
 type ClaudeAgentSdkLike = {
   query(params: {
     prompt: string | AsyncIterable<unknown>;
     options?: ClaudeAgentSdkOptions;
-  }): AsyncIterable<ClaudeAgentSdkMessage>;
+  }): ClaudeAgentSdkQuery;
   createSdkMcpServer?(options: {
     name: string;
     version?: string;
@@ -91,6 +107,13 @@ export interface ClaudeAgentSdkDriverConfig {
   model?: string;
   debugEvents?: boolean;
   /**
+   * AUTH-2: opt-in plain-string system prompt. When set, it REPLACES the
+   * `claude_code` preset (and `request.instruction` is appended to it) so a
+   * non-coding agent is not forced into the full coding-agent persona/token
+   * cost. When unset, the driver keeps the preset+append default.
+   */
+  systemPrompt?: string;
+  /**
    * If set, the driver passes this session id to the Claude SDK
    * `options.resume` field and sends only the current user turn (not the full
    * ADK history) so the SDK appends to the resumed session instead of
@@ -111,12 +134,13 @@ export class ClaudeAgentSdkDriver {
   readonly #env: Record<string, string | undefined>;
   readonly #pathToClaudeCodeExecutable?: string;
   readonly #executableSearchPaths: string[];
-  readonly #settingSources?: ClaudeAgentSdkSettingSource[];
+  readonly #settingSources: ClaudeAgentSdkSettingSource[];
   readonly #maxTurns?: number;
   readonly #model?: string;
   readonly #debugEvents: boolean;
   readonly #resumeSessionId?: string;
   readonly #forkSession?: boolean;
+  readonly #systemPrompt?: string;
 
   constructor(config: ClaudeAgentSdkDriverConfig = {}) {
     this.#sdk = config.sdk;
@@ -124,12 +148,19 @@ export class ClaudeAgentSdkDriver {
     this.#env = config.env ?? process.env;
     this.#pathToClaudeCodeExecutable = config.pathToClaudeCodeExecutable;
     this.#executableSearchPaths = config.executableSearchPaths ?? [];
-    this.#settingSources = config.settingSources;
+    // AUTH-1: default to SDK isolation (`[]`) instead of `undefined`. Leaving it
+    // undefined causes `removeUndefined` to strip the key, which makes the SDK
+    // load ALL host setting sources (user `~/.claude` + project `.claude` +
+    // local) — permission rules, MCP servers, hooks, CLAUDE.md — and can
+    // silently override the intended policy. Consumers opt back in by passing an
+    // explicit allowlist.
+    this.#settingSources = config.settingSources ?? [];
     this.#maxTurns = config.maxTurns;
     this.#model = config.model;
     this.#debugEvents = config.debugEvents ?? false;
     this.#resumeSessionId = config.resumeSessionId;
     this.#forkSession = config.forkSession;
+    this.#systemPrompt = config.systemPrompt;
   }
 
   async *run(request: ExternalAgentRunRequest): AsyncIterable<ExternalAgentEvent> {
@@ -145,25 +176,63 @@ export class ClaudeAgentSdkDriver {
 
     let completed = false;
     let failed = false;
+    let emittedOutput = false;
+    // LIFECYCLE-1: capture the Query so we can tear down the spawned `claude`
+    // subprocess on early consumer break or thrown error. We drive the iterator
+    // manually (rather than `for await`) so the `finally` reliably runs even
+    // when the consumer breaks out of *this* generator early — a `for await`
+    // over the inner Query can swallow the outer return on some runtimes.
+    // `query()` itself is invoked inside the try so a synchronous throw is
+    // classified too. The `finally` runs on normal completion, break, AND throw.
+    let query: ClaudeAgentSdkQuery | undefined;
     try {
-      for await (const message of sdk.query({ prompt, options })) {
+      query = sdk.query({ prompt, options });
+      const iterator = query[Symbol.asyncIterator]();
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) {
+          break;
+        }
+        const message = next.value;
+        // ERR-3: if the turn produced no streamed assistant text, fall back to
+        // the aggregated `result.result` on a successful result message so the
+        // run does not complete with silent-empty output.
+        if (!emittedOutput && isSuccessResultWithText(message)) {
+          const text = stringValue(asRecord(message).result);
+          if (text) {
+            emittedOutput = true;
+            yield { type: "output", content: text, timestamp: Date.now() };
+          }
+        }
         const events = this.normalizeMessage(message);
         for (const event of events) {
           if (event.type === "completed") {
             completed = true;
+          }
+          if (event.type === "output") {
+            emittedOutput = true;
           }
           yield event;
         }
       }
     } catch (error) {
       failed = true;
+      const message = this.describeError(error, request);
+      const classification = classifyRecoverable({
+        message,
+        fallbackCode: "CLAUDE_AGENT_SDK_ERROR",
+      });
       yield {
         type: "error",
-        message: this.describeError(error, request),
-        code: "CLAUDE_AGENT_SDK_ERROR",
-        recoverable: true,
+        message,
+        code: classification.code,
+        recoverable: classification.recoverable,
         timestamp: Date.now(),
       };
+    } finally {
+      if (query) {
+        await this.disposeQuery(query, completed);
+      }
     }
 
     if (!completed) {
@@ -176,6 +245,7 @@ export class ClaudeAgentSdkDriver {
     const options: ClaudeAgentSdkOptions = {
       cwd: request.workingDirectory,
       env: this.buildEnv(request),
+      abortController: this.buildAbortController(request),
       permissionMode: permission.permissionMode,
       additionalDirectories: request.permissions?.allowedPaths
         ? [...request.permissions.allowedPaths]
@@ -184,15 +254,31 @@ export class ClaudeAgentSdkDriver {
       settingSources: this.#settingSources,
       maxTurns: this.#maxTurns,
       model: this.#model,
-      systemPrompt: request.instruction
-        ? { type: "preset", preset: "claude_code", append: request.instruction }
-        : { type: "preset", preset: "claude_code" },
+      systemPrompt: this.buildSystemPrompt(request),
       allowDangerouslySkipPermissions: permission.allowDangerouslySkipPermissions,
       resume: this.#resumeSessionId,
       forkSession: this.#forkSession,
     };
 
     return removeUndefined(options) as ClaudeAgentSdkOptions;
+  }
+
+  /**
+   * AUTH-2: resolve the system prompt. A configured plain-string
+   * `systemPrompt` replaces the `claude_code` preset (with the run instruction
+   * appended); otherwise the preset+append default is kept.
+   */
+  private buildSystemPrompt(
+    request: ExternalAgentRunRequest,
+  ): ClaudeAgentSdkOptions["systemPrompt"] {
+    if (this.#systemPrompt) {
+      return request.instruction
+        ? `${this.#systemPrompt}\n\n${request.instruction}`
+        : this.#systemPrompt;
+    }
+    return request.instruction
+      ? { type: "preset", preset: "claude_code", append: request.instruction }
+      : { type: "preset", preset: "claude_code" };
   }
 
   /**
@@ -293,6 +379,59 @@ export class ClaudeAgentSdkDriver {
     return env;
   }
 
+  /**
+   * Build the `AbortController` wired into `options.abortController` (LIFECYCLE-1).
+   * The SDK aborts the spawned `claude` subprocess and releases resources when
+   * this controller fires. We bridge the shared run cancellation signal
+   * (`request.abortSignal` ?? `context.abortSignal`) onto a fresh controller so
+   * the driver also owns a handle it can abort from its own `finally` cleanup.
+   */
+  private buildAbortController(
+    request: ExternalAgentRunRequest,
+  ): AbortController {
+    const controller = new AbortController();
+    const signal = resolveAbortSignal(request);
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort(signal.reason);
+      } else {
+        signal.addEventListener(
+          "abort",
+          () => controller.abort(signal.reason),
+          { once: true },
+        );
+      }
+    }
+    return controller;
+  }
+
+  /**
+   * Tear down a Query (LIFECYCLE-1). When the loop ends early (break/throw)
+   * the turn is still in flight, so `interrupt()` is requested first to stop
+   * the spawned subprocess gracefully; `return()` then finalizes the
+   * generator. Both are best-effort — disposal must never mask the original
+   * outcome, so all errors here are swallowed.
+   */
+  private async disposeQuery(
+    query: ClaudeAgentSdkQuery,
+    completed: boolean,
+  ): Promise<void> {
+    if (!completed && typeof query.interrupt === "function") {
+      try {
+        await query.interrupt();
+      } catch {
+        // best-effort: subprocess may already be gone
+      }
+    }
+    if (typeof query.return === "function") {
+      try {
+        await query.return(undefined);
+      } catch {
+        // best-effort: generator may already be finalized
+      }
+    }
+  }
+
   normalizeMessage(message: ClaudeAgentSdkMessage): ExternalAgentEvent[] {
     const record = asRecord(message);
     const type = stringValue(record.type);
@@ -300,12 +439,19 @@ export class ClaudeAgentSdkDriver {
     if (type === "assistant") {
       const error = stringValue(record.error);
       if (error) {
+        // `record.error` is an SDKAssistantMessageError subtype
+        // (authentication_failed/billing_error/rate_limit/server_error/…).
+        const classification = classifyRecoverable({
+          subtype: error,
+          message: error,
+          fallbackCode: error,
+        });
         return [
           {
             type: "error",
             message: error,
-            code: error,
-            recoverable: true,
+            code: classification.code,
+            recoverable: classification.recoverable,
             timestamp: Date.now(),
           },
         ];
@@ -323,12 +469,23 @@ export class ClaudeAgentSdkDriver {
       const errors = Array.isArray(record.errors)
         ? record.errors.filter((item): item is string => typeof item === "string")
         : [];
+      const subtype = stringValue(record.subtype);
+      const message =
+        errors.join("\n") ||
+        `Claude Agent SDK result: ${String(record.subtype ?? "error")}`;
+      // SDKResultError subtype (error_max_turns/error_max_budget_usd/
+      // error_max_structured_output_retries/error_during_execution).
+      const classification = classifyRecoverable({
+        subtype,
+        message,
+        fallbackCode: subtype ?? "CLAUDE_AGENT_SDK_RESULT_ERROR",
+      });
       return [
         {
           type: "error",
-          message: errors.join("\n") || `Claude Agent SDK result: ${String(record.subtype ?? "error")}`,
-          code: stringValue(record.subtype),
-          recoverable: true,
+          message,
+          code: classification.code,
+          recoverable: classification.recoverable,
           timestamp: Date.now(),
         },
         { type: "completed", exitCode: 1, timestamp: Date.now() },
@@ -337,18 +494,46 @@ export class ClaudeAgentSdkDriver {
 
     if (type === "auth_status") {
       const error = stringValue(record.error);
-      return error
-        ? [{ type: "error", message: error, code: "CLAUDE_AUTH_STATUS", recoverable: true, timestamp: Date.now() }]
-        : [];
-    }
-
-    if (type === "system" && record.subtype === "permission_denied") {
+      if (!error) {
+        return [];
+      }
+      const classification = classifyRecoverable({
+        subtype: "CLAUDE_AUTH_STATUS",
+        message: error,
+        fallbackCode: "CLAUDE_AUTH_STATUS",
+      });
       return [
         {
           type: "error",
-          message: stringValue(record.message) ?? "Claude permission denied",
+          message: error,
+          code: classification.code,
+          recoverable: classification.recoverable,
+          timestamp: Date.now(),
+        },
+      ];
+    }
+
+    if (type === "system" && record.subtype === "permission_denied") {
+      // ERR-1 was REFUTED: keep the base SDK rejection message. ERR-2 enriches
+      // it with tool_name / decision_reason when present. Permission denials do
+      // not become allowed by retrying, so they are non-recoverable.
+      const base = stringValue(record.message) ?? "Claude permission denied";
+      const toolName = stringValue(record.tool_name);
+      const decisionReason =
+        stringValue(record.decision_reason) ??
+        stringValue(record.decision_reason_type);
+      const details = [
+        toolName ? `tool: ${toolName}` : undefined,
+        decisionReason ? `reason: ${decisionReason}` : undefined,
+      ].filter((part): part is string => part !== undefined);
+      const message =
+        details.length > 0 ? `${base} (${details.join(", ")})` : base;
+      return [
+        {
+          type: "error",
+          message,
           code: "CLAUDE_PERMISSION_DENIED",
-          recoverable: true,
+          recoverable: false,
           timestamp: Date.now(),
         },
       ];
@@ -468,7 +653,12 @@ export function mapPolicyToClaudeSdkPermission(
   const flags = mapPermissionPolicyToFlags(policy);
 
   if (flags.readOnly) {
-    return { permissionMode: "plan" };
+    // A read-only policy must still answer questions and run read-only tools.
+    // `"plan"` is interactive planning mode (explore-without-executing, driven
+    // by ExitPlanMode) and can stall a plain Q&A run or return a plan artifact
+    // instead of an answer. `"default"` keeps normal execution while the
+    // bridge's read-only permission rules continue to gate write/edit tools.
+    return { permissionMode: "default" };
   }
   if (flags.workspaceWrite) {
     return { permissionMode: "acceptEdits" };
@@ -670,6 +860,16 @@ function copyIfPresent(
 function removeUndefined(value: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(value).filter(([, entry]) => entry !== undefined),
+  );
+}
+
+function isSuccessResultWithText(message: ClaudeAgentSdkMessage): boolean {
+  const record = asRecord(message);
+  return (
+    record.type === "result" &&
+    record.subtype === "success" &&
+    typeof record.result === "string" &&
+    record.result.length > 0
   );
 }
 

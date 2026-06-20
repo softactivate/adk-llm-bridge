@@ -130,8 +130,10 @@ describe("CodexSdkDriver", () => {
       {
         type: "error",
         message: expect.stringContaining("Set CODEX_EXECUTABLE=/absolute/path/to/codex"),
-        code: "CODEX_SDK_ERROR",
-        recoverable: true,
+        // A missing-binary condition is non-recoverable: retrying without
+        // installing the binary is futile (CODEX-5).
+        code: "MISSING_BINARY",
+        recoverable: false,
         timestamp: expect.any(Number),
       },
       { type: "completed", exitCode: 1, timestamp: expect.any(Number) },
@@ -616,5 +618,300 @@ describe("CodexSdkDriver", () => {
       },
       { type: "completed", exitCode: 1, timestamp: expect.any(Number) },
     ]);
+  });
+
+  // ===========================================================================
+  // CODEX-3: env passthrough (proxy/cert/CODEX_HOME) + CODEX_ACCESS_TOKEN
+  // ===========================================================================
+
+  test("CODEX_ENV_ALLOWLIST includes CODEX_ACCESS_TOKEN", () => {
+    expect(CODEX_PROVIDER.envAllowlist).toContain("CODEX_ACCESS_TOKEN");
+  });
+
+  test("buildEnv forwards ambient proxy/cert/CODEX_HOME vars and CODEX_ACCESS_TOKEN", () => {
+    const driver = new CodexSdkDriver({
+      env: {
+        PATH: "/bin",
+        HOME: "/home/example",
+        HTTPS_PROXY: "http://proxy.internal:3128",
+        https_proxy: "http://proxy.internal:3128",
+        HTTP_PROXY: "http://proxy.internal:3128",
+        http_proxy: "http://proxy.internal:3128",
+        NO_PROXY: "localhost,127.0.0.1",
+        no_proxy: "localhost,127.0.0.1",
+        SSL_CERT_FILE: "/etc/ssl/cert.pem",
+        SSL_CERT_DIR: "/etc/ssl/certs",
+        CODEX_HOME: "/home/example/.codex",
+        IRRELEVANT: "dropped",
+      },
+    });
+
+    const env = driver.buildEnv({
+      provider: CODEX_PROVIDER,
+      context: {} as never,
+      credential: {
+        kind: "env",
+        env: { CODEX_ACCESS_TOKEN: "tok-123" },
+      },
+    });
+
+    expect(env).toMatchObject({
+      PATH: "/bin",
+      HOME: "/home/example",
+      HTTPS_PROXY: "http://proxy.internal:3128",
+      https_proxy: "http://proxy.internal:3128",
+      HTTP_PROXY: "http://proxy.internal:3128",
+      http_proxy: "http://proxy.internal:3128",
+      NO_PROXY: "localhost,127.0.0.1",
+      no_proxy: "localhost,127.0.0.1",
+      SSL_CERT_FILE: "/etc/ssl/cert.pem",
+      SSL_CERT_DIR: "/etc/ssl/certs",
+      CODEX_HOME: "/home/example/.codex",
+      CODEX_ACCESS_TOKEN: "tok-123",
+    });
+    expect(env.IRRELEVANT).toBeUndefined();
+  });
+
+  test("credential CODEX_HOME overrides the ambient CODEX_HOME", () => {
+    const driver = new CodexSdkDriver({
+      env: { CODEX_HOME: "/ambient/.codex" },
+    });
+
+    const env = driver.buildEnv({
+      provider: CODEX_PROVIDER,
+      context: {} as never,
+      credential: { kind: "env", env: { CODEX_HOME: "/credential/.codex" } },
+    });
+
+    expect(env.CODEX_HOME).toBe("/credential/.codex");
+  });
+
+  // ===========================================================================
+  // CODEX-4: thread.started captures the id immediately (resumability survives
+  // a mid-turn throw).
+  // ===========================================================================
+
+  test("emits state_delta from thread.started even when the stream throws mid-turn", async () => {
+    const driver = new CodexSdkDriver({
+      sdk: {
+        startThread: () =>
+          ({
+            // `id` is null until a turn completes; resumability must come from
+            // the thread.started event, not this accessor.
+            id: null,
+            runStreamed: async () => ({
+              // eslint-disable-next-line require-yield
+              events: (async function* () {
+                yield { type: "thread.started", thread_id: "thread-mid-fail" };
+                throw new Error("boom mid-turn");
+              })(),
+            }),
+          }) as never,
+        resumeThread: () => {
+          throw new Error("not used");
+        },
+      },
+    });
+
+    const events = [];
+    for await (const event of driver.run({
+      provider: CODEX_PROVIDER,
+      agent: { name: "codex" } as never,
+      context: {
+        agent: { name: "codex" },
+        session: { state: {} },
+        userContent: { role: "user", parts: [{ text: "hi" }] },
+      } as never,
+      permissions: { mode: "read-only" },
+    })) {
+      events.push(event);
+    }
+
+    const stateDelta = events.find((e) => e.type === "state_delta");
+    expect(stateDelta).toEqual({
+      type: "state_delta",
+      stateDelta: { "codex_thread:codex": "thread-mid-fail" },
+      timestamp: expect.any(Number),
+    });
+    // The mid-turn throw is still surfaced as an error + completed(1).
+    expect(events.some((e) => e.type === "error")).toBe(true);
+    // Exactly one state_delta (no duplicate from the post-loop accessor).
+    expect(events.filter((e) => e.type === "state_delta")).toHaveLength(1);
+  });
+
+  // ===========================================================================
+  // CODEX-5: error classification — auth/missing-binary non-recoverable;
+  // transport recoverable.
+  // ===========================================================================
+
+  test.each([
+    ["401 Unauthorized: invalid api key", false, "AUTH_ERROR"],
+    ["Request failed: 403 Forbidden", false, "AUTH_ERROR"],
+    [
+      "Unable to locate Codex CLI binaries. Ensure @openai/codex is installed.",
+      false,
+      "MISSING_BINARY",
+    ],
+    ["billing_error: insufficient credit", false, "BILLING_ERROR"],
+    ["rate limit exceeded, please retry", true, "RATE_LIMIT"],
+    ["connection timed out", true, "TRANSPORT_ERROR"],
+  ])(
+    "run() classifies thrown error %p as recoverable=%p (%s)",
+    async (message, recoverable, code) => {
+      const driver = new CodexSdkDriver({
+        Codex: class {
+          startThread() {
+            throw new Error(message as string);
+          }
+          resumeThread() {
+            throw new Error("not used");
+          }
+        },
+      });
+
+      const events = [];
+      for await (const event of driver.run({
+        provider: CODEX_PROVIDER,
+        context: {} as never,
+      })) {
+        events.push(event);
+      }
+
+      const error = events.find((e) => e.type === "error") as
+        | { recoverable: boolean; code: string }
+        | undefined;
+      expect(error).toBeDefined();
+      expect(error?.recoverable).toBe(recoverable as boolean);
+      expect(error?.code).toBe(code as string);
+    },
+  );
+
+  test("turn.failed with a 401 message is non-recoverable", () => {
+    const driver = new CodexSdkDriver();
+    const [error] = driver.normalizeEvent({
+      type: "turn.failed",
+      error: { message: "401 unauthorized — invalid credentials" },
+    });
+    expect(error).toMatchObject({
+      type: "error",
+      recoverable: false,
+      code: "AUTH_ERROR",
+    });
+  });
+
+  // ===========================================================================
+  // CODEX-7: web search forwarded only when network access is enabled.
+  // ===========================================================================
+
+  test("drops webSearch options when allowNetwork is false", () => {
+    const driver = new CodexSdkDriver({
+      webSearchMode: "live",
+      webSearchEnabled: true,
+    });
+
+    const options = driver.buildThreadOptions({
+      provider: CODEX_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "read-only", allowNetwork: false },
+    });
+
+    expect(options.webSearchMode).toBeUndefined();
+    expect(options.webSearchEnabled).toBeUndefined();
+  });
+
+  test("forwards webSearch options when allowNetwork is true", () => {
+    const driver = new CodexSdkDriver({
+      webSearchMode: "live",
+      webSearchEnabled: true,
+    });
+
+    const options = driver.buildThreadOptions({
+      provider: CODEX_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "read-only", allowNetwork: true },
+    });
+
+    expect(options.networkAccessEnabled).toBe(true);
+    expect(options.webSearchMode).toBe("live");
+    expect(options.webSearchEnabled).toBe(true);
+  });
+});
+
+// ===========================================================================
+// CODEX-1: example credential guard keys on real Codex signals (not "codex on
+// PATH"); driver adds no OPENAI_API_KEY fallback to credential resolution.
+// ===========================================================================
+
+describe("basic-agent-codex credential guard (CODEX-1)", () => {
+  const CRED_KEYS = [
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_EXECUTABLE",
+    "CODEX_CLI_PATH",
+    "CODEX_HOME",
+  ] as const;
+
+  function withClearedEnv<T>(fn: () => T): T {
+    const saved: Record<string, string | undefined> = {};
+    for (const key of CRED_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    try {
+      return fn();
+    } finally {
+      for (const key of CRED_KEYS) {
+        if (saved[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = saved[key];
+        }
+      }
+    }
+  }
+
+  test("returns true for a readable auth.json with no PATH binary, false for none", async () => {
+    const { codexCredentialsAvailable } = await import(
+      "../../../examples/basic-agent-codex/agent.ts"
+    );
+
+    await withClearedEnv(async () => {
+      // No credential at all → false (an absent CODEX_HOME points at
+      // ~/.codex/auth.json which does not exist in CI).
+      process.env.CODEX_HOME = join(
+        mkdtempSync(join(tmpdir(), "codex-empty-home-")),
+      );
+      expect(codexCredentialsAvailable()).toBe(false);
+
+      // A readable auth.json under $CODEX_HOME → true, even with no PATH binary.
+      const home = mkdtempSync(join(tmpdir(), "codex-home-"));
+      writeFileSync(join(home, "auth.json"), '{"OPENAI_API_KEY":"x"}');
+      process.env.CODEX_HOME = home;
+      expect(codexCredentialsAvailable()).toBe(true);
+    });
+  });
+
+  test("returns true when CODEX_API_KEY is set", async () => {
+    const { codexCredentialsAvailable } = await import(
+      "../../../examples/basic-agent-codex/agent.ts"
+    );
+    await withClearedEnv(() => {
+      process.env.CODEX_HOME = mkdtempSync(join(tmpdir(), "codex-empty-"));
+      process.env.CODEX_API_KEY = "key-abc";
+      expect(codexCredentialsAvailable()).toBe(true);
+    });
+  });
+
+  test("driver credential resolution has no OPENAI_API_KEY fallback", () => {
+    // Only OPENAI_API_KEY present in env — the driver must NOT pick it up as the
+    // Codex apiKey (CODEX-2 refuted: OPENAI_API_KEY is not a Codex CLI var).
+    const driver = new CodexSdkDriver({
+      env: { OPENAI_API_KEY: "openai-only" },
+    });
+    const options = driver.buildClientOptions({
+      provider: CODEX_PROVIDER,
+      context: {} as never,
+    });
+    expect(options.apiKey).toBeUndefined();
   });
 });

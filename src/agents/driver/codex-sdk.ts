@@ -9,15 +9,36 @@ import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Content } from "@google/genai";
 import type { ExternalAgentEvent } from "../events.js";
-import type { ExternalAgentRunRequest } from "../external-agent-driver.js";
+import {
+  type ExternalAgentRunRequest,
+  resolveAbortSignal,
+} from "../external-agent-driver.js";
 import type { ExternalAgentPermissionPolicy } from "../permissions/schema.js";
 import { CODEX_PROVIDER } from "../provider/codex.js";
 import { collectContents } from "../runtime/content-collector.js";
+import { classifyRecoverable } from "../runtime/error-classification.js";
 import {
   type CodexInputPart,
   summarizeHistoryForColdStart,
   userContentToCodexInput,
 } from "./codex-input-mapper.js";
+
+/**
+ * Ambient environment variables forwarded from `this.#env` into the Codex SDK's
+ * replacement env (the SDK does not inherit `process.env`). Covers proxy/cert
+ * egress configuration plus a custom shell `CODEX_HOME` (CODEX-3).
+ */
+const CODEX_AMBIENT_PASSTHROUGH = [
+  "HTTPS_PROXY",
+  "https_proxy",
+  "HTTP_PROXY",
+  "http_proxy",
+  "NO_PROXY",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "CODEX_HOME",
+] as const;
 
 type CodexSdkApprovalMode = "never" | "on-request" | "on-failure" | "untrusted";
 type CodexSdkSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
@@ -200,10 +221,37 @@ export class CodexSdkDriver {
       }
 
       const { events } = await thread.runStreamed(input, {
-        signal: request.context?.abortSignal,
+        signal: resolveAbortSignal(request),
         outputSchema: this.#outputSchema,
       });
+
+      // Track the thread id as soon as it is known so resumability survives a
+      // mid-turn throw. The `thread.started` event carries it before the first
+      // turn completes; we emit the `state_delta` immediately (CODEX-4) and
+      // remember it so the post-loop read does not re-emit.
+      let emittedThreadId: string | undefined;
+      const emitThreadId = (threadId: string | undefined) => {
+        if (!stateKey || !threadId) return undefined;
+        if (threadId === savedThreadId || threadId === emittedThreadId) {
+          return undefined;
+        }
+        emittedThreadId = threadId;
+        const delta: ExternalAgentEvent = {
+          type: "state_delta",
+          stateDelta: { [stateKey]: threadId },
+          timestamp: Date.now(),
+        };
+        return delta;
+      };
+
       for await (const event of events) {
+        if (stringValue(event.type) === "thread.started") {
+          const delta = emitThreadId(threadStartedId(event));
+          if (delta) {
+            yield delta;
+          }
+          continue;
+        }
         for (const normalized of this.normalizeEvent(event)) {
           if (normalized.type === "completed") {
             pendingEvents.push(normalized);
@@ -213,13 +261,11 @@ export class CodexSdkDriver {
         }
       }
 
-      const newThreadId = thread.id ?? undefined;
-      if (stateKey && newThreadId && newThreadId !== savedThreadId) {
-        yield {
-          type: "state_delta",
-          stateDelta: { [stateKey]: newThreadId },
-          timestamp: Date.now(),
-        };
+      // Fallback: if `thread.started` was never observed (older event stream),
+      // persist the id from the post-loop accessor.
+      const postLoopDelta = emitThreadId(thread.id ?? undefined);
+      if (postLoopDelta) {
+        yield postLoopDelta;
       }
 
       for (const event of pendingEvents) {
@@ -230,11 +276,16 @@ export class CodexSdkDriver {
       }
     } catch (error) {
       failed = true;
+      const rawMessage = error instanceof Error ? error.message : String(error);
+      const { recoverable, code } = classifyRecoverable({
+        message: rawMessage,
+        fallbackCode: "CODEX_SDK_ERROR",
+      });
       yield {
         type: "error",
         message: this.describeError(error, request),
-        code: "CODEX_SDK_ERROR",
-        recoverable: true,
+        code,
+        recoverable,
         timestamp: Date.now(),
       };
     } finally {
@@ -261,14 +312,19 @@ export class CodexSdkDriver {
   }
 
   buildThreadOptions(request: ExternalAgentRunRequest): CodexSdkThreadOptions {
+    const policyOptions = mapPolicyToCodexSdkThreadOptions(request.permissions);
+    // Web search needs network egress. When the resolved sandbox has network
+    // access disabled (`policy.allowNetwork:false`), requesting web search asks
+    // for egress the sandbox cannot grant, so omit it entirely (CODEX-7).
+    const networkAccessEnabled = policyOptions.networkAccessEnabled === true;
     return removeUndefined({
-      ...mapPolicyToCodexSdkThreadOptions(request.permissions),
+      ...policyOptions,
       model: this.#model,
       workingDirectory: request.workingDirectory,
       skipGitRepoCheck: this.#skipGitRepoCheck,
       modelReasoningEffort: this.#modelReasoningEffort,
-      webSearchMode: this.#webSearchMode,
-      webSearchEnabled: this.#webSearchEnabled,
+      webSearchMode: networkAccessEnabled ? this.#webSearchMode : undefined,
+      webSearchEnabled: networkAccessEnabled ? this.#webSearchEnabled : undefined,
     }) as CodexSdkThreadOptions;
   }
 
@@ -307,6 +363,17 @@ export class CodexSdkDriver {
     copyIfPresent(this.#env, env, "SHELL");
     copyIfPresent(this.#env, env, "XDG_CONFIG_HOME");
 
+    // The SDK builds a *replacement* env (it does not inherit `process.env`
+    // when `env` is supplied), so ambient proxy/cert vars must be forwarded
+    // explicitly or egress through a corporate proxy / custom CA breaks. A
+    // custom shell `CODEX_HOME` is also carried through here so it is not lost
+    // when it is not delivered via a structured credential (CODEX-3). When a
+    // credential supplies one of these keys it overrides the ambient value via
+    // the allowlist loop below.
+    for (const key of CODEX_AMBIENT_PASSTHROUGH) {
+      copyIfPresent(this.#env, env, key);
+    }
+
     if (request.credential?.kind === "env") {
       for (const key of request.provider.envAllowlist ?? []) {
         const value = request.credential.env?.[key];
@@ -329,12 +396,17 @@ export class CodexSdkDriver {
 
     if (type === "turn.failed") {
       const error = asRecord(event.error);
+      const message = stringValue(error.message) ?? "Codex turn failed";
+      const { recoverable, code } = classifyRecoverable({
+        message,
+        fallbackCode: "CODEX_TURN_FAILED",
+      });
       return [
         {
           type: "error",
-          message: stringValue(error.message) ?? "Codex turn failed",
-          code: "CODEX_TURN_FAILED",
-          recoverable: true,
+          message,
+          code,
+          recoverable,
           timestamp,
         },
         { type: "completed", exitCode: 1, timestamp },
@@ -342,12 +414,17 @@ export class CodexSdkDriver {
     }
 
     if (type === "error") {
+      const message = stringValue(event.message) ?? "Codex SDK error";
+      const { recoverable, code } = classifyRecoverable({
+        message,
+        fallbackCode: "CODEX_SDK_STREAM_ERROR",
+      });
       return [
         {
           type: "error",
-          message: stringValue(event.message) ?? "Codex SDK error",
-          code: "CODEX_SDK_STREAM_ERROR",
-          recoverable: true,
+          message,
+          code,
+          recoverable,
           timestamp,
         },
       ];
@@ -525,12 +602,17 @@ function normalizeCompletedItem(
   }
 
   if (itemType === "error") {
+    const message = stringValue(item.message) ?? "Codex item error";
+    const { recoverable, code } = classifyRecoverable({
+      message,
+      fallbackCode: "CODEX_ITEM_ERROR",
+    });
     return [
       {
         type: "error",
-        message: stringValue(item.message) ?? "Codex item error",
-        code: "CODEX_ITEM_ERROR",
-        recoverable: true,
+        message,
+        code,
+        recoverable,
         timestamp,
       },
     ];
@@ -620,6 +702,14 @@ function normalizeCompletedItem(
   }
 
   return [];
+}
+
+/**
+ * Extract the thread id from a `thread.started` event. The SDK shape is
+ * `ThreadStartedEvent { type: "thread.started", thread_id }`.
+ */
+function threadStartedId(event: CodexSdkThreadEvent): string | undefined {
+  return stringValue(event.thread_id) ?? stringValue((asRecord(event.thread)).id);
 }
 
 function safeCollectContents(request: ExternalAgentRunRequest): Content[] {

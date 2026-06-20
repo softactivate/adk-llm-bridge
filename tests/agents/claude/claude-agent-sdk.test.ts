@@ -2,7 +2,10 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { ClaudeAgent } from "../../../src/agents/claude-agent.js";
+import {
+  ClaudeAgent,
+  CLAUDE_AGENT_DEFINITION,
+} from "../../../src/agents/claude-agent.js";
 import {
   ClaudeAgentSdkDriver,
   mapPolicyToClaudeSdkPermission,
@@ -173,9 +176,12 @@ describe("ClaudeAgentSdkDriver", () => {
   });
 
   test("maps bridge permissions to Claude SDK permission modes", () => {
-    expect(mapPolicyToClaudeSdkPermission({ mode: "read-only" })).toEqual({
-      permissionMode: "plan",
-    });
+    // PERM-1: read-only must NOT map to interactive planning mode ("plan"),
+    // which refuses tool execution; it maps to "default" so Q&A/read-only tools
+    // still run while write/edit stays gated.
+    const readOnly = mapPolicyToClaudeSdkPermission({ mode: "read-only" });
+    expect(readOnly).toEqual({ permissionMode: "default" });
+    expect(readOnly.permissionMode).not.toBe("plan");
     expect(mapPolicyToClaudeSdkPermission({ mode: "ask" })).toEqual({
       permissionMode: "default",
     });
@@ -491,4 +497,349 @@ describe("ClaudeAgentSdkDriver", () => {
       "completed",
     ]);
   });
+
+  // --- AUTH-1: SDK isolation via settingSources default ---
+  test("defaults settingSources to [] (SDK isolation), not omitted", () => {
+    const driver = new ClaudeAgentSdkDriver();
+
+    const options = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+    });
+
+    // The key must be PRESENT (not stripped by removeUndefined) and empty,
+    // so the SDK does not load host user/project/local settings.
+    expect("settingSources" in options).toBe(true);
+    expect(options.settingSources).toEqual([]);
+  });
+
+  test("allows opting back into specific settingSources", () => {
+    const driver = new ClaudeAgentSdkDriver({ settingSources: ["project"] });
+
+    const options = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+    });
+
+    expect(options.settingSources).toEqual(["project"]);
+  });
+
+  // --- LIFECYCLE-1: abortController + interrupt()/return() teardown ---
+  test("sets an abortController on options wired to the run abort signal", () => {
+    const driver = new ClaudeAgentSdkDriver();
+    const controller = new AbortController();
+
+    const options = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+      abortSignal: controller.signal,
+    });
+
+    expect(options.abortController).toBeInstanceOf(AbortController);
+    expect(options.abortController?.signal.aborted).toBe(false);
+    controller.abort();
+    expect(options.abortController?.signal.aborted).toBe(true);
+  });
+
+  test("interrupts and returns the Query when the consumer breaks early", async () => {
+    let interrupted = false;
+    let returned = false;
+    const driver = new ClaudeAgentSdkDriver({
+      sdk: {
+        query: () => {
+          const gen = (async function* () {
+            yield {
+              type: "assistant",
+              message: { content: [{ type: "text", text: "one" }] },
+            } as never;
+            yield {
+              type: "assistant",
+              message: { content: [{ type: "text", text: "two" }] },
+            } as never;
+            yield { type: "result", subtype: "success", result: "done" } as never;
+          })();
+          return Object.assign(gen, {
+            interrupt: async () => {
+              interrupted = true;
+            },
+            return: async (value?: unknown) => {
+              returned = true;
+              return gen.return(value as never);
+            },
+          });
+        },
+      },
+    });
+
+    for await (const event of driver.run({
+      provider: CLAUDE_PROVIDER,
+      context: { userContent: { parts: [{ text: "hi" }] } } as never,
+      permissions: { mode: "ask" },
+    })) {
+      if (event.type === "output") {
+        break; // early break after the first output
+      }
+    }
+
+    expect(interrupted).toBe(true);
+    expect(returned).toBe(true);
+  });
+
+  test("returns the Query on normal completion without interrupting", async () => {
+    let interrupted = false;
+    let returned = false;
+    const driver = new ClaudeAgentSdkDriver({
+      sdk: {
+        query: () => {
+          const gen = (async function* () {
+            yield { type: "result", subtype: "success", result: "done" } as never;
+          })();
+          return Object.assign(gen, {
+            interrupt: async () => {
+              interrupted = true;
+            },
+            return: async (value?: unknown) => {
+              returned = true;
+              return gen.return(value as never);
+            },
+          });
+        },
+      },
+    });
+
+    for await (const _event of driver.run({
+      provider: CLAUDE_PROVIDER,
+      context: { userContent: { parts: [{ text: "hi" }] } } as never,
+      permissions: { mode: "ask" },
+    })) {
+      void _event;
+    }
+
+    // Completed normally: no interrupt needed, but return() still finalizes.
+    expect(interrupted).toBe(false);
+    expect(returned).toBe(true);
+  });
+
+  // --- ERR-2: typed error classification ---
+  test("classifies assistant/result error subtypes as (non-)recoverable", () => {
+    const driver = new ClaudeAgentSdkDriver();
+
+    const cases: Array<{
+      message: ClaudeAgentSdkMessageInput;
+      recoverable: boolean;
+      code?: string;
+    }> = [
+      {
+        message: { type: "assistant", error: "authentication_failed" },
+        recoverable: false,
+        code: "CLAUDE_AUTH_ERROR",
+      },
+      {
+        message: { type: "assistant", error: "billing_error" },
+        recoverable: false,
+        code: "CLAUDE_BILLING_ERROR",
+      },
+      {
+        message: { type: "assistant", error: "rate_limit" },
+        recoverable: true,
+        code: "CLAUDE_RATE_LIMIT",
+      },
+      {
+        message: { type: "assistant", error: "server_error" },
+        recoverable: true,
+        code: "CLAUDE_SERVER_ERROR",
+      },
+      {
+        message: { type: "result", subtype: "error_max_turns", errors: ["max turns"] },
+        recoverable: false,
+        code: "error_max_turns",
+      },
+      {
+        message: {
+          type: "result",
+          subtype: "error_max_budget_usd",
+          errors: ["budget"],
+        },
+        recoverable: false,
+        code: "error_max_budget_usd",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const events = driver.normalizeMessage(testCase.message as never);
+      const errorEvent = events.find((event) => event.type === "error");
+      expect(errorEvent).toBeDefined();
+      if (errorEvent?.type === "error") {
+        expect(errorEvent.recoverable).toBe(testCase.recoverable);
+        if (testCase.code) {
+          expect(errorEvent.code).toBe(testCase.code);
+        }
+      }
+    }
+  });
+
+  test("run catch classifies auth errors as non-recoverable", async () => {
+    const driver = new ClaudeAgentSdkDriver({
+      sdk: {
+        query: () => {
+          throw new Error("401 Unauthorized: invalid api key");
+        },
+      },
+    });
+
+    const events = [];
+    for await (const event of driver.run({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+    })) {
+      events.push(event);
+    }
+
+    const errorEvent = events.find((event) => event.type === "error");
+    expect(errorEvent).toBeDefined();
+    if (errorEvent?.type === "error") {
+      expect(errorEvent.recoverable).toBe(false);
+    }
+  });
+
+  // --- ERR-2 / ERR-1-guard: permission-denied enrichment ---
+  test("appends tool_name and decision_reason to permission-denied (keeps base message)", () => {
+    const driver = new ClaudeAgentSdkDriver();
+
+    const events = driver.normalizeMessage({
+      type: "system",
+      subtype: "permission_denied",
+      message: "Permission to run Bash was denied",
+      tool_name: "Bash",
+      decision_reason: "rule: deny dangerous commands",
+    } as never);
+
+    expect(events).toHaveLength(1);
+    const event = events[0];
+    expect(event.type).toBe("error");
+    if (event.type === "error") {
+      // Base message (ERR-1 refuted) MUST be preserved...
+      expect(event.message).toContain("Permission to run Bash was denied");
+      // ...and enriched with tool_name + decision_reason.
+      expect(event.message).toContain("Bash");
+      expect(event.message).toContain("rule: deny dangerous commands");
+      expect(event.code).toBe("CLAUDE_PERMISSION_DENIED");
+      expect(event.recoverable).toBe(false);
+    }
+  });
+
+  // --- ERR-3: result success fallback ---
+  test("falls back to result.result when no assistant text was streamed", async () => {
+    const driver = new ClaudeAgentSdkDriver({
+      sdk: {
+        query: () =>
+          (async function* () {
+            yield {
+              type: "result",
+              subtype: "success",
+              result: "final aggregated answer",
+            } as never;
+          })() as never,
+      },
+    });
+
+    const outputs: string[] = [];
+    for await (const event of driver.run({
+      provider: CLAUDE_PROVIDER,
+      context: { userContent: { parts: [{ text: "hi" }] } } as never,
+      permissions: { mode: "ask" },
+    })) {
+      if (event.type === "output") {
+        outputs.push(event.content);
+      }
+    }
+
+    expect(outputs).toContain("final aggregated answer");
+  });
+
+  test("does NOT duplicate output when assistant text already streamed", async () => {
+    const driver = new ClaudeAgentSdkDriver({
+      sdk: {
+        query: () =>
+          (async function* () {
+            yield {
+              type: "assistant",
+              message: { content: [{ type: "text", text: "streamed answer" }] },
+            } as never;
+            yield {
+              type: "result",
+              subtype: "success",
+              result: "streamed answer",
+            } as never;
+          })() as never,
+      },
+    });
+
+    const outputs: string[] = [];
+    for await (const event of driver.run({
+      provider: CLAUDE_PROVIDER,
+      context: { userContent: { parts: [{ text: "hi" }] } } as never,
+      permissions: { mode: "ask" },
+    })) {
+      if (event.type === "output") {
+        outputs.push(event.content);
+      }
+    }
+
+    expect(outputs).toEqual(["streamed answer"]);
+  });
+
+  // --- AUTH-2: plain-string system prompt opt-in ---
+  test("uses preset+append system prompt by default", () => {
+    const driver = new ClaudeAgentSdkDriver();
+
+    const options = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+      instruction: "Be concise.",
+    });
+
+    expect(options.systemPrompt).toEqual({
+      type: "preset",
+      preset: "claude_code",
+      append: "Be concise.",
+    });
+  });
+
+  test("honors a configured plain-string system prompt", () => {
+    const driver = new ClaudeAgentSdkDriver({
+      systemPrompt: "You are a helpful Q&A assistant.",
+    });
+
+    const withInstruction = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+      instruction: "Answer briefly.",
+    });
+    expect(typeof withInstruction.systemPrompt).toBe("string");
+    expect(withInstruction.systemPrompt).toContain(
+      "You are a helpful Q&A assistant.",
+    );
+    expect(withInstruction.systemPrompt).toContain("Answer briefly.");
+
+    const noInstruction = driver.buildOptions({
+      provider: CLAUDE_PROVIDER,
+      context: {} as never,
+      permissions: { mode: "ask" },
+    });
+    expect(noInstruction.systemPrompt).toBe("You are a helpful Q&A assistant.");
+  });
+
+  // --- STREAM-1: capability claim matches actual behavior ---
+  test("does not advertise token-level streaming", () => {
+    expect(CLAUDE_AGENT_DEFINITION.capabilities.streaming).toBe(false);
+  });
 });
+
+type ClaudeAgentSdkMessageInput = Record<string, unknown>;

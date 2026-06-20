@@ -58,9 +58,9 @@
     "typecheck:compat:nodenext": "bun run build && bunx tsc -p tests/compat/nodenext-consumer/tsconfig.json"
   },
   "peerDependencies": {
-    "@anthropic-ai/claude-agent-sdk": ">=0.2.138",
+    "@anthropic-ai/claude-agent-sdk": ">=0.2.138 <0.4",
     "@google/adk": ">=0.6.1 <2",
-    "@openai/codex-sdk": ">=0.130.0"
+    "@openai/codex-sdk": ">=0.130.0 <0.142"
   },
   "peerDependenciesMeta": {
     "@anthropic-ai/claude-agent-sdk": {
@@ -76,12 +76,12 @@
     "openai": "^6.37.0"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.138",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.183",
     "@arethetypeswrong/cli": "^0.18.3",
     "@biomejs/biome": "^2.3.10",
     "@google/adk": "^1.2.0",
     "@google/genai": "^2.0.1",
-    "@openai/codex-sdk": "^0.130.0",
+    "@openai/codex-sdk": "^0.141.0",
     "@types/bun": "latest",
     "bunup": "^0.16.32",
     "publint": "^0.3.21",
