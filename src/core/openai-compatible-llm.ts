@@ -17,12 +17,19 @@
 
 import type { LlmRequest, LlmResponse } from "@google/adk";
 import OpenAI from "openai";
-import { convertRequest } from "../converters/request.js";
+import { convertRequest, supportsReasoningEffort } from "../converters/request.js";
 import {
   convertResponse,
   convertStreamChunk,
   createStreamAccumulator,
 } from "../converters/response.js";
+import {
+  convertChatRequestToResponses,
+  convertResponsesResponse,
+  convertResponsesStreamEvent,
+  createResponsesAccumulator,
+  type ReasoningSummary,
+} from "../converters/responses.js";
 import type { BaseProviderConfig } from "../types.js";
 import { BaseProviderLlm } from "./base-provider-llm.js";
 import { resolveConfig } from "./config-resolver.js";
@@ -144,6 +151,18 @@ export class OpenAICompatibleLlm extends BaseProviderLlm {
     return this._getRequestOptions?.() ?? {};
   }
 
+  /**
+   * Returns the requested reasoning summary verbosity when this instance should
+   * use the Responses API: the `reasoningSummary` option is set AND the resolved
+   * model is reasoning-capable. Otherwise undefined (stay on Chat Completions).
+   */
+  private responsesReasoningSummary(): ReasoningSummary | undefined {
+    const summary = (this.config as { reasoningSummary?: ReasoningSummary })
+      .reasoningSummary;
+    if (!summary) return undefined;
+    return supportsReasoningEffort(this.model) ? summary : undefined;
+  }
+
   async *generateContentAsync(
     llmRequest: LlmRequest,
     stream = false,
@@ -154,6 +173,24 @@ export class OpenAICompatibleLlm extends BaseProviderLlm {
         this.model,
       );
 
+      const reasoningSummary = this.responsesReasoningSummary();
+      if (reasoningSummary) {
+        const body = convertChatRequestToResponses(
+          messages,
+          this.model,
+          reasoningSummary,
+          tools,
+          params,
+          toolChoice,
+        );
+        if (stream) {
+          yield* this.streamViaResponses(body);
+        } else {
+          yield await this.singleViaResponses(body);
+        }
+        return;
+      }
+
       if (stream) {
         yield* this.streamResponse(messages, tools, params, toolChoice);
       } else {
@@ -162,6 +199,43 @@ export class OpenAICompatibleLlm extends BaseProviderLlm {
     } catch (error) {
       yield this.createErrorResponse(error, this.getErrorPrefix());
     }
+  }
+
+  /** Non-streaming Responses API call. */
+  private async singleViaResponses(
+    body: OpenAI.Responses.ResponseCreateParamsNonStreaming,
+  ): Promise<LlmResponse> {
+    const response = await this.client.responses.create({
+      ...body,
+      stream: false,
+      ...this.getProviderRequestOptions(),
+    });
+    return convertResponsesResponse(response);
+  }
+
+  /** Streaming Responses API call: yields reasoning + text deltas, then final. */
+  private async *streamViaResponses(
+    body: OpenAI.Responses.ResponseCreateParamsNonStreaming,
+  ): AsyncGenerator<LlmResponse, void> {
+    const stream = await this.client.responses.create({
+      ...body,
+      stream: true,
+      ...this.getProviderRequestOptions(),
+    } as OpenAI.Responses.ResponseCreateParamsStreaming);
+
+    const acc = createResponsesAccumulator();
+    let finalResponse: LlmResponse | undefined;
+
+    for await (const event of stream) {
+      const { response, isComplete } = convertResponsesStreamEvent(event, acc);
+      if (isComplete) {
+        finalResponse = response;
+        continue;
+      }
+      if (response) yield response;
+    }
+
+    if (finalResponse) yield finalResponse;
   }
 
   private async singleResponse(

@@ -432,6 +432,23 @@ export interface OpenAIProviderConfig extends BaseProviderConfig {
    * @example "proj-xxx"
    */
   project?: string;
+
+  /**
+   * Opt in to the OpenAI **Responses API** to capture a reasoning model's
+   * reasoning summary.
+   *
+   * The Chat Completions API never returns a native OpenAI reasoning model's
+   * reasoning text (only a `reasoning_tokens` count), so the only way to surface
+   * the model's reasoning is the Responses API with `reasoning.summary`. When
+   * this is set AND the resolved model is reasoning-capable (gpt-5 / o-series),
+   * the OpenAI provider routes requests through the responses endpoint and emits the
+   * streamed reasoning summary as ADK `{ thought: true }` parts. Non-reasoning
+   * models and other providers are unaffected (they stay on Chat Completions).
+   *
+   * @defaultValue undefined (stay on Chat Completions)
+   * @see {@link https://platform.openai.com/docs/guides/reasoning|OpenAI reasoning}
+   */
+  reasoningSummary?: "auto" | "concise" | "detailed";
 }
 
 /**

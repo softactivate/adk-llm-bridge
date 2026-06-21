@@ -35,3 +35,11 @@ export {
   convertStreamChunk,
   createStreamAccumulator,
 } from "./response.js";
+export {
+  convertChatRequestToResponses,
+  convertResponsesResponse,
+  convertResponsesStreamEvent,
+  createResponsesAccumulator,
+  type ReasoningSummary,
+  type ResponsesAccumulator,
+} from "./responses.js";
